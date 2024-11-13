@@ -1,4 +1,4 @@
-module github.com/xlab/treeprint
+module github.com/ououmania/treeprint
 
 go 1.13
 

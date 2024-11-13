@@ -18,6 +18,46 @@ type MetaValue interface{}
 // NodeVisitor function type for iterating over nodes
 type NodeVisitor func(item *Node)
 
+type PrintMetaFunc func(MetaValue, io.Writer)
+type PrintValueFunc func(Value, io.Writer)
+
+type PrintFunc struct {
+	MetaFunc  PrintMetaFunc
+	ValueFunc PrintValueFunc
+}
+
+func (p PrintFunc) printNode(n *Node, w io.Writer) {
+	if n.Meta != nil {
+		p.printMeta(n.Meta, w)
+	}
+	p.printValue(n.Value, w)
+}
+
+func (p PrintFunc) printMeta(m MetaValue, w io.Writer) {
+	if p.MetaFunc != nil {
+		p.MetaFunc(m, w)
+	} else {
+		DefaultPrintMeta(m, w)
+	}
+	fmt.Fprintf(w, "  ")
+}
+
+func (p PrintFunc) printValue(v Value, w io.Writer) {
+	if p.ValueFunc != nil {
+		p.ValueFunc(v, w)
+	} else {
+		DefaultPrintValue(v, w)
+	}
+}
+
+func DefaultPrintMeta(m MetaValue, w io.Writer) {
+	fmt.Fprintf(w, "[%v]", m)
+}
+
+func DefaultPrintValue(v Value, w io.Writer) {
+	fmt.Fprintf(w, "%v", v)
+}
+
 // Tree represents a tree structure with leaf-nodes and branch-nodes.
 type Tree interface {
 	// AddNode adds a new Node to a branch.
@@ -40,9 +80,11 @@ type Tree interface {
 	//  returns the last Node of a tree
 	FindLastNode() Tree
 	// String renders the tree or subtree as a string.
+	Print(PrintFunc) string
+	// String renders the tree or subtree as a string.
 	String() string
 	// Bytes renders the tree or subtree as byteslice.
-	Bytes() []byte
+	Bytes(PrintFunc) []byte
 
 	SetValue(value Value)
 	SetMetaValue(meta MetaValue)
@@ -133,16 +175,16 @@ func (n *Node) FindByValue(value Value) Tree {
 	return nil
 }
 
-func (n *Node) Bytes() []byte {
+func (n *Node) Bytes(f PrintFunc) []byte {
 	buf := new(bytes.Buffer)
 	level := 0
 	var levelsEnded []int
+	p := printer{
+		Writer: buf,
+		pf:     f,
+	}
 	if n.Root == nil {
-		if n.Meta != nil {
-			buf.WriteString(fmt.Sprintf("[%v]  %v", n.Meta, n.Value))
-		} else {
-			buf.WriteString(fmt.Sprintf("%v", n.Value))
-		}
+		f.printNode(n, buf)
 		buf.WriteByte('\n')
 	} else {
 		edge := EdgeTypeMid
@@ -150,16 +192,20 @@ func (n *Node) Bytes() []byte {
 			edge = EdgeTypeEnd
 			levelsEnded = append(levelsEnded, level)
 		}
-		printValues(buf, 0, levelsEnded, edge, n)
+		printValues(&p, 0, levelsEnded, edge, n)
 	}
 	if len(n.Nodes) > 0 {
-		printNodes(buf, level, levelsEnded, n.Nodes)
+		printNodes(&p, level, levelsEnded, n.Nodes)
 	}
 	return buf.Bytes()
 }
 
+func (n *Node) Print(f PrintFunc) string {
+	return string(n.Bytes(f))
+}
+
 func (n *Node) String() string {
-	return string(n.Bytes())
+	return string(n.Bytes(PrintFunc{}))
 }
 
 func (n *Node) SetValue(value Value) {
@@ -181,41 +227,42 @@ func (n *Node) VisitAll(fn NodeVisitor) {
 	}
 }
 
-func printNodes(wr io.Writer,
-	level int, levelsEnded []int, nodes []*Node) {
+type printer struct {
+	io.Writer
+	pf PrintFunc
+}
 
+func printNodes(p *printer, level int, levelsEnded []int, nodes []*Node) {
 	for i, node := range nodes {
 		edge := EdgeTypeMid
 		if i == len(nodes)-1 {
 			levelsEnded = append(levelsEnded, level)
 			edge = EdgeTypeEnd
 		}
-		printValues(wr, level, levelsEnded, edge, node)
+		printValues(p, level, levelsEnded, edge, node)
 		if len(node.Nodes) > 0 {
-			printNodes(wr, level+1, levelsEnded, node.Nodes)
+			printNodes(p, level+1, levelsEnded, node.Nodes)
 		}
 	}
 }
 
-func printValues(wr io.Writer,
-	level int, levelsEnded []int, edge EdgeType, node *Node) {
-
+func printValues(p *printer, level int, levelsEnded []int, edge EdgeType, node *Node) {
 	for i := 0; i < level; i++ {
 		if isEnded(levelsEnded, i) {
-			fmt.Fprint(wr, strings.Repeat(" ", IndentSize+1))
+			fmt.Fprint(p, strings.Repeat(" ", IndentSize+1))
 			continue
 		}
-		fmt.Fprintf(wr, "%s%s", EdgeTypeLink, strings.Repeat(" ", IndentSize))
+		fmt.Fprintf(p, "%s%s", EdgeTypeLink, strings.Repeat(" ", IndentSize))
 	}
 
-	val := renderValue(level, node)
+	val := renderValue(p, level, node)
 	meta := node.Meta
 
+	fmt.Fprintf(p, "%s ", edge)
 	if meta != nil {
-		fmt.Fprintf(wr, "%s [%v]  %v\n", edge, meta, val)
-		return
+		p.pf.printMeta(meta, p)
 	}
-	fmt.Fprintf(wr, "%s %v\n", edge, val)
+	fmt.Fprintf(p, "%v\n", val)
 }
 
 func isEnded(levelsEnded []int, level int) bool {
@@ -227,8 +274,10 @@ func isEnded(levelsEnded []int, level int) bool {
 	return false
 }
 
-func renderValue(level int, node *Node) Value {
-	lines := strings.Split(fmt.Sprintf("%v", node.Value), "\n")
+func renderValue(p *printer, level int, node *Node) Value {
+	buf := new(bytes.Buffer)
+	p.pf.printValue(node.Value, buf)
+	lines := strings.Split(buf.String(), "\n")
 
 	// If value does not contain multiple lines, return itself.
 	if len(lines) < 2 {
@@ -276,8 +325,10 @@ type EdgeType string
 
 var (
 	EdgeTypeLink EdgeType = "│"
-	EdgeTypeMid  EdgeType = "├──"
-	EdgeTypeEnd  EdgeType = "└──"
+
+	EdgeTypeMid EdgeType = "├──"
+
+	EdgeTypeEnd EdgeType = "└──"
 )
 
 // IndentSize is the number of spaces per tree level.
