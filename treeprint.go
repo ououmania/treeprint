@@ -18,43 +18,68 @@ type MetaValue interface{}
 // NodeVisitor function type for iterating over nodes
 type NodeVisitor func(item *Node)
 
-type PrintMetaFunc func(MetaValue, io.Writer)
-type PrintValueFunc func(Value, io.Writer)
+type PruneFunc func(item *Node) bool
 
-type PrintFunc struct {
-	MetaFunc  PrintMetaFunc
-	ValueFunc PrintValueFunc
+type PrintMetaFunc func(MetaValue, io.Writer)
+type PrintValuePrint func(Value, io.Writer)
+
+type PrinterOptions struct {
+	metaFunc   PrintMetaFunc
+	valuePrint PrintValuePrint
 }
 
-func (p PrintFunc) printNode(n *Node, w io.Writer) {
+type Option func(*PrinterOptions)
+
+func WithMetaFunc(f PrintMetaFunc) Option {
+	return func(p *PrinterOptions) {
+		p.metaFunc = f
+	}
+}
+
+func WithValuePrint(f PrintValuePrint) Option {
+	return func(p *PrinterOptions) {
+		p.valuePrint = f
+	}
+}
+
+func NewPrinter(options ...Option) PrinterOptions {
+	p := PrinterOptions{
+		metaFunc:   defaultPrintMeta,
+		valuePrint: defaultPrintValue,
+	}
+
+	for _, opt := range options {
+		opt(&p)
+	}
+
+	return p
+}
+
+func (p PrinterOptions) printNode(n *Node, w io.Writer) {
 	if n.Meta != nil {
 		p.printMeta(n.Meta, w)
 	}
 	p.printValue(n.Value, w)
 }
 
-func (p PrintFunc) printMeta(m MetaValue, w io.Writer) {
-	if p.MetaFunc != nil {
-		p.MetaFunc(m, w)
-	} else {
-		DefaultPrintMeta(m, w)
-	}
-	fmt.Fprintf(w, "  ")
-}
-
-func (p PrintFunc) printValue(v Value, w io.Writer) {
-	if p.ValueFunc != nil {
-		p.ValueFunc(v, w)
-	} else {
-		DefaultPrintValue(v, w)
+func (p PrinterOptions) printMeta(m MetaValue, w io.Writer) {
+	if p.metaFunc != nil {
+		p.metaFunc(m, w)
+		fmt.Fprintf(w, "  ")
 	}
 }
 
-func DefaultPrintMeta(m MetaValue, w io.Writer) {
+func (p PrinterOptions) printValue(v Value, w io.Writer) {
+	if p.valuePrint != nil {
+		p.valuePrint(v, w)
+	}
+}
+
+func defaultPrintMeta(m MetaValue, w io.Writer) {
 	fmt.Fprintf(w, "[%v]", m)
 }
 
-func DefaultPrintValue(v Value, w io.Writer) {
+func defaultPrintValue(v Value, w io.Writer) {
 	fmt.Fprintf(w, "%v", v)
 }
 
@@ -80,11 +105,11 @@ type Tree interface {
 	//  returns the last Node of a tree
 	FindLastNode() Tree
 	// String renders the tree or subtree as a string.
-	Print(PrintFunc) string
+	Print(PrinterOptions) string
 	// String renders the tree or subtree as a string.
 	String() string
 	// Bytes renders the tree or subtree as byteslice.
-	Bytes(PrintFunc) []byte
+	Bytes(PrinterOptions) []byte
 
 	SetValue(value Value)
 	SetMetaValue(meta MetaValue)
@@ -93,6 +118,10 @@ type Tree interface {
 	// If need to iterate over the whole tree, use the root Node.
 	// Note this method uses a breadth-first approach.
 	VisitAll(fn NodeVisitor)
+
+	Prune(fn PruneFunc)
+
+	ChildCount() int
 }
 
 type Node struct {
@@ -175,7 +204,7 @@ func (n *Node) FindByValue(value Value) Tree {
 	return nil
 }
 
-func (n *Node) Bytes(f PrintFunc) []byte {
+func (n *Node) Bytes(f PrinterOptions) []byte {
 	buf := new(bytes.Buffer)
 	level := 0
 	var levelsEnded []int
@@ -200,12 +229,12 @@ func (n *Node) Bytes(f PrintFunc) []byte {
 	return buf.Bytes()
 }
 
-func (n *Node) Print(f PrintFunc) string {
-	return string(n.Bytes(f))
+func (n *Node) Print(f PrinterOptions) string {
+	return strings.Trim(string(n.Bytes(f)), " \n")
 }
 
 func (n *Node) String() string {
-	return string(n.Bytes(PrintFunc{}))
+	return string(n.Bytes(PrinterOptions{}))
 }
 
 func (n *Node) SetValue(value Value) {
@@ -214,6 +243,20 @@ func (n *Node) SetValue(value Value) {
 
 func (n *Node) SetMetaValue(meta MetaValue) {
 	n.Meta = meta
+}
+
+func (n *Node) Prune(fn PruneFunc) {
+	temp := n.Nodes[:0]
+	for _, node := range n.Nodes {
+		if fn(node) {
+			continue
+		}
+		temp = append(temp, node)
+		if len(node.Nodes) > 0 {
+			node.Prune(fn)
+		}
+	}
+	n.Nodes = temp
 }
 
 func (n *Node) VisitAll(fn NodeVisitor) {
@@ -227,9 +270,13 @@ func (n *Node) VisitAll(fn NodeVisitor) {
 	}
 }
 
+func (n *Node) ChildCount() int {
+	return len(n.Nodes)
+}
+
 type printer struct {
 	io.Writer
-	pf PrintFunc
+	pf PrinterOptions
 }
 
 func printNodes(p *printer, level int, levelsEnded []int, nodes []*Node) {
@@ -274,14 +321,14 @@ func isEnded(levelsEnded []int, level int) bool {
 	return false
 }
 
-func renderValue(p *printer, level int, node *Node) Value {
+func renderValue(p *printer, level int, node *Node) string {
 	buf := new(bytes.Buffer)
 	p.pf.printValue(node.Value, buf)
 	lines := strings.Split(buf.String(), "\n")
 
 	// If value does not contain multiple lines, return itself.
 	if len(lines) < 2 {
-		return node.Value
+		return buf.String()
 	}
 
 	// If value contains multiple lines,
